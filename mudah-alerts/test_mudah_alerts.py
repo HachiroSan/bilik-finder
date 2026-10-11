@@ -173,7 +173,7 @@ class ConfigTests(unittest.TestCase):
     def test_defaults_apply_and_paths_resolve_from_config_dir(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             config = parse_config({"keywords": ["alpha"]}, base_dir=Path(tmp))
-        self.assertEqual(config.poll_interval_seconds, 120.0)
+        self.assertEqual(config.poll_interval_seconds, 3600.0)
         self.assertEqual(config.freshness_hours, 48.0)
         self.assertEqual(config.max_pages_per_keyword, 2)
         self.assertEqual(config.database_path, (Path(tmp) / "mudah_alerts.db").resolve())

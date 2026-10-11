@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Standalone Telegram alert service for permission-gated Mudah searches.
+"""Combined Telegram alert service for Mudah and iBilik searches.
 
-The service reuses the sibling ``mudah-finder/mudah.py`` client. Adding that
-directory to ``sys.path`` at import time avoids copying the scraper, and no
-change to the finder is required. It polls one or more keyword searches, keeps
-only listings published inside a freshness window, and sends each unseen
-listing to Telegram once. Seen state lives in SQLite so restarts and overlapping
-keyword searches do not resend the same ad.
+The service reuses the sibling ``mudah-finder/mudah.py`` and
+``ibilik-finder/ibilik.py`` clients. Adding those directories to ``sys.path`` at
+import time avoids copying either scraper, and no change to the finders is
+required. Mudah keyword searches and an ``ibilik`` block of saved searches run
+in one process and share one Telegram sender. Each provider keeps its own SQLite
+state, so an iBilik listing id can never collide with a Mudah one and a fetch
+failure on one provider leaves the other polling.
 
 Mudah's robots.txt says automated access needs permission. Set
-``MUDAH_AUTOMATION_ALLOWED=1`` only after you are authorised. Telegram
-credentials are read from ``TELEGRAM_BOT_TOKEN`` and ``TELEGRAM_CHAT_ID``.
+``MUDAH_AUTOMATION_ALLOWED=1`` only after you are authorised. When it is not
+``1`` the service logs a warning and skips the Mudah side, while an ``ibilik``
+block keeps polling (iBilik is a public API). Telegram credentials are read from
+``TELEGRAM_BOT_TOKEN`` and ``TELEGRAM_CHAT_ID``.
 """
 
 from __future__ import annotations
@@ -30,15 +33,19 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# Reuse the sibling finder instead of copying its scraper.
+# Reuse the sibling finders instead of copying their scrapers.
 _FINDER_DIR = Path(__file__).resolve().parent.parent / "mudah-finder"
 if str(_FINDER_DIR) not in sys.path:
     sys.path.insert(0, str(_FINDER_DIR))
+_IBILIK_FINDER_DIR = Path(__file__).resolve().parent.parent / "ibilik-finder"
+if str(_IBILIK_FINDER_DIR) not in sys.path:
+    sys.path.insert(0, str(_IBILIK_FINDER_DIR))
 
+import ibilik  # type: ignore[import-not-found]  # noqa: E402  (import after sys.path setup)
 import mudah  # type: ignore[import-not-found]  # noqa: E402  (import after sys.path setup)
 
 
@@ -47,23 +54,32 @@ __all__ = [
     "AlertService",
     "ConfigError",
     "CycleReport",
+    "IbilikAlertService",
+    "IbilikConfig",
+    "IbilikCycleReport",
+    "IbilikSearch",
+    "IbilikSentStore",
     "Keyword",
     "LockError",
     "SentStore",
     "SendResult",
     "SingleInstanceLock",
     "TelegramSender",
+    "build_ibilik_message",
     "build_message",
     "is_fresh",
     "listing_published_at",
     "load_config",
+    "load_dotenv",
     "parse_timestamp",
     "sender_from_env",
 ]
 
 MYT = timezone(timedelta(hours=8))
 
-DEFAULT_POLL_SECONDS = 120.0
+# One provider cycle per hour by default: room alerts are not urgent, and a
+# gentler cadence is kinder to both sites. Config may still choose 60s..24h.
+DEFAULT_POLL_SECONDS = 3600.0
 MIN_POLL_SECONDS = 60.0
 DEFAULT_FRESHNESS_HOURS = 48.0
 # Mudah freshness is capped at the hard 48-hour rule in both config and runtime.
@@ -76,6 +92,9 @@ MAX_SEARCH_TIMEOUT = 300.0
 
 BACKOFF_BASE_SECONDS = 30.0
 BACKOFF_CAP_SECONDS = 30.0 * 60.0
+# Smallest wait the provider scheduler will request. Real poll intervals are at
+# least MIN_POLL_SECONDS; this only keeps a zero-length delay from spinning.
+MIN_SCHEDULE_WAIT = 0.05
 TELEGRAM_API_ROOT = "https://api.telegram.org"
 TELEGRAM_429_DEFAULT_COOLDOWN = 60.0
 MESSAGE_HARD_LIMIT = 4096
@@ -83,6 +102,17 @@ MESSAGE_SOFT_LIMIT = 4000
 MAX_LISTING_URL_LENGTH = 2048
 _MAX_RELATIVE_DIGITS = 12
 _MAX_RELATIVE_SECONDS = 100 * 365 * 86400
+
+# iBilik has no published 48-hour rule, so its window is broader but still
+# capped, and polling stays gentle: at most ten 100-item pages per search.
+DEFAULT_IBILIK_FRESHNESS_HOURS = 48.0
+MAX_IBILIK_FRESHNESS_HOURS = 24 * 7
+DEFAULT_IBILIK_PAGES_PER_SEARCH = 3
+MAX_IBILIK_PAGES_PER_SEARCH = 10
+DEFAULT_IBILIK_LIMIT = 100
+MAX_IBILIK_LIMIT = 100
+MAX_IBILIK_AMENITIES = 20
+_IBILIK_SEARCH_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 DB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS sent (
@@ -99,6 +129,33 @@ CREATE TABLE IF NOT EXISTS sent (
     last_attempt_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_mudah_alerts_sent_at ON sent(sent_at);
+"""
+
+# iBilik state lives in its own tables in the same database file. The composite
+# key (search_name, listing_id) keeps two saved searches and the Mudah table
+# independent, so a UUID from iBilik can never shadow a Mudah row.
+DB_IBILIK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS ibilik_sent (
+    search_name    TEXT NOT NULL,
+    listing_id     TEXT NOT NULL,
+    keyword        TEXT,
+    url            TEXT,
+    title          TEXT,
+    price          REAL,
+    published_at   TEXT,
+    first_seen_at  TEXT NOT NULL,
+    seeded_at      TEXT,
+    sent_at        TEXT,
+    failure_count  INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT,
+    last_attempt_at TEXT,
+    PRIMARY KEY (search_name, listing_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ibilik_sent_at ON ibilik_sent(sent_at);
+CREATE TABLE IF NOT EXISTS ibilik_searches (
+    search_name    TEXT PRIMARY KEY,
+    initialized_at TEXT
+);
 """
 
 _SECRET_KEYS = {
@@ -504,6 +561,81 @@ def build_message(
     return text
 
 
+def _validated_ibilik_url(url) -> str | None:
+    if not isinstance(url, str):
+        return None
+    candidate = url.strip()
+    if not candidate or len(candidate) > MAX_LISTING_URL_LENGTH:
+        return None
+    try:
+        parsed = urllib.parse.urlparse(candidate)
+        host = parsed.hostname
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or not host:
+        return None
+    host = host.lower()
+    if host != "ibilik.com" and not host.endswith(".ibilik.com"):
+        return None
+    return candidate
+
+
+def _ibilik_location(item: dict) -> str:
+    parts = [item.get("state"), item.get("city"), item.get("area")]
+    return " / ".join(str(part) for part in parts if part)
+
+
+def _ibilik_price_unit(charge_unit) -> str:
+    if charge_unit == "PER_MONTH":
+        return "/month"
+    if charge_unit == "PER_NIGHT":
+        return "/night"
+    return ""
+
+
+def build_ibilik_message(
+    item: dict,
+    *,
+    published_at: datetime | None = None,
+    now: datetime | None = None,
+    limit: int = MESSAGE_SOFT_LIMIT,
+) -> str | None:
+    """Build a clickable Telegram HTML message for one iBilik listing.
+
+    The body names the provider, then the title, rent, location, and a relative
+    posted time when the listing has one. Contact numbers and WhatsApp flags are
+    deliberately dropped: they belong to real people and do not belong in an
+    alert. Returns ``None`` for a listing without an iBilik URL or a usable
+    price, so a malformed ad is skipped rather than sent half-empty.
+    """
+
+    url = _validated_ibilik_url(item.get("url"))
+    if url is None:
+        return None
+
+    price = _numeric_price(item.get("price"))
+    if price is None:
+        return None
+
+    raw_title = str(item.get("title") or "iBilik listing").strip() or "iBilik listing"
+    tail = ["iBilik", f"{_format_price(price)}{_ibilik_price_unit(item.get('charge_unit'))}"]
+    location = _ibilik_location(item)
+    if location:
+        tail.append(_escape_html(location))
+    if isinstance(published_at, datetime):
+        tail.append(f"Posted {_format_posted(published_at, now)}")
+    link = f'<a href="{_escape_html(url)}">Open on iBilik</a>'
+
+    reserved = sum(len(line) + 1 for line in tail) + len(link) + len("<b></b>") + 2
+    if reserved >= limit:
+        return None
+    title_html = _fit_title(raw_title, reserved, limit)
+    text = "\n".join([f"<b>{title_html}</b>", *tail, link])
+    if len(text) > MESSAGE_HARD_LIMIT:
+        return None
+    return text
+
+
 # --------------------------------------------------------------------------
 # Telegram sending
 # --------------------------------------------------------------------------
@@ -624,6 +756,65 @@ class Keyword:
 
 
 @dataclass(frozen=True)
+class IbilikSearch:
+    """One saved iBilik search.
+
+    ``name`` namespaces its dedupe state, so two searches never share rows even
+    when they return the same listing. The remaining fields map straight onto
+    the documented iBilik filter parameters; location values are iBilik codes
+    such as ``cheras`` or ``selangor``, not display names.
+    """
+
+    name: str
+    query: str | None = None
+    state: str | None = None
+    city: str | None = None
+    area: str | None = None
+    min_price: int | None = None
+    max_price: int | None = None
+    room_type: str | None = None
+    bathroom_type: str | None = None
+    unit_type: str | None = None
+    floor_level: str | None = None
+    min_sqft: int | None = None
+    max_sqft: int | None = None
+    kyc_verified: bool | None = None
+    amenities: tuple[str, ...] = ()
+
+    def as_filters(self) -> dict:
+        return {
+            "query": self.query,
+            "state": self.state,
+            "city": self.city,
+            "area": self.area,
+            "min_price": self.min_price,
+            "max_price": self.max_price,
+            "room_type": self.room_type,
+            "bathroom_type": self.bathroom_type,
+            "unit_type": self.unit_type,
+            "floor_level": self.floor_level,
+            "min_sqft": self.min_sqft,
+            "max_sqft": self.max_sqft,
+            "kyc_verified": self.kyc_verified,
+            "amenities": list(self.amenities),
+        }
+
+
+@dataclass(frozen=True)
+class IbilikConfig:
+    """Validated opt-in iBilik polling settings."""
+
+    searches: tuple[IbilikSearch, ...]
+    poll_interval_seconds: float = DEFAULT_POLL_SECONDS
+    freshness_hours: float = DEFAULT_IBILIK_FRESHNESS_HOURS
+    max_pages_per_search: int = DEFAULT_IBILIK_PAGES_PER_SEARCH
+    limit_per_page: int = DEFAULT_IBILIK_LIMIT
+    page_pacing_seconds: float = DEFAULT_PAGE_PACING_SECONDS
+    search_timeout_seconds: float = DEFAULT_SEARCH_TIMEOUT
+    initial_seed: bool = True
+
+
+@dataclass(frozen=True)
 class AlertConfig:
     """Validated service configuration.
 
@@ -642,6 +833,7 @@ class AlertConfig:
     max_pages_per_keyword: int = 2
     page_pacing_seconds: float = DEFAULT_PAGE_PACING_SECONDS
     search_timeout_seconds: float = DEFAULT_SEARCH_TIMEOUT
+    ibilik: IbilikConfig | None = None
 
     @property
     def lock_path(self) -> Path:
@@ -735,6 +927,212 @@ def _parse_keywords(raw) -> tuple[Keyword, ...]:
     return tuple(keywords)
 
 
+_IBILIK_SEARCH_KEYS = {
+    "name",
+    "query",
+    "state",
+    "city",
+    "area",
+    "min_price",
+    "max_price",
+    "room_type",
+    "bathroom_type",
+    "unit_type",
+    "floor_level",
+    "min_sqft",
+    "max_sqft",
+    "kyc_verified",
+    "amenities",
+}
+
+
+def _optional_text(name: str, value, maximum: int) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ConfigError(f"{name} must be a string")
+    text = value.strip()
+    if not text:
+        return None
+    if len(text) > maximum:
+        raise ConfigError(f"{name} must be at most {maximum} characters")
+    return text
+
+
+def _location_code(name: str, value) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[a-z0-9]+(?:-[a-z0-9]+)*", value.strip().lower()
+    ):
+        raise ConfigError(
+            f"{name} must be a lowercase iBilik location code such as 'cheras'"
+        )
+    return value.strip().lower()
+
+
+def _choice(name: str, value, allowed) -> str | None:
+    if value is None:
+        return None
+    if value not in allowed:
+        raise ConfigError(f"{name} must be one of: " + ", ".join(sorted(allowed)))
+    return value
+
+
+def _parse_ibilik_amenities(name: str, value) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ConfigError(f"{name} must be a list of amenity codes")
+    if len(value) > MAX_IBILIK_AMENITIES:
+        raise ConfigError(f"{name} accepts at most {MAX_IBILIK_AMENITIES} codes")
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for code in value:
+        if not isinstance(code, str):
+            raise ConfigError(f"{name} must be a list of strings")
+        code = code.strip()
+        if code and code not in seen:
+            seen.add(code)
+            cleaned.append(code)
+    return tuple(cleaned)
+
+
+def _parse_ibilik_searches(raw) -> tuple[IbilikSearch, ...]:
+    if not isinstance(raw, list) or not raw:
+        raise ConfigError("ibilik.searches must be a non-empty list")
+    searches: list[IbilikSearch] = []
+    names: set[str] = set()
+    for index, entry in enumerate(raw, start=1):
+        prefix = f"ibilik.searches[{index}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{prefix} must be an object")
+        unknown = set(entry) - _IBILIK_SEARCH_KEYS
+        if unknown:
+            raise ConfigError(f"{prefix} has unknown keys: {', '.join(sorted(unknown))}")
+        name = entry.get("name")
+        if not isinstance(name, str) or not _IBILIK_SEARCH_NAME_RE.fullmatch(name.strip()):
+            raise ConfigError(f"{prefix}.name must match [A-Za-z0-9_-]{{1,64}}")
+        name = name.strip()
+        if name in names:
+            raise ConfigError(f"{prefix}.name duplicates {name!r}")
+        names.add(name)
+
+        min_price = _whole_number(f"{prefix}.min_price", entry.get("min_price"), 0, 10_000_000)
+        max_price = _whole_number(f"{prefix}.max_price", entry.get("max_price"), 0, 10_000_000)
+        if min_price is not None and max_price is not None and min_price > max_price:
+            raise ConfigError(f"{prefix}.min_price must be <= max_price")
+
+        kyc = entry.get("kyc_verified")
+        if kyc is not None and not isinstance(kyc, bool):
+            raise ConfigError(f"{prefix}.kyc_verified must be true or false")
+
+        searches.append(
+            IbilikSearch(
+                name=name,
+                query=_optional_text(f"{prefix}.query", entry.get("query"), 100),
+                state=_location_code(f"{prefix}.state", entry.get("state")),
+                city=_location_code(f"{prefix}.city", entry.get("city")),
+                area=_location_code(f"{prefix}.area", entry.get("area")),
+                min_price=min_price,
+                max_price=max_price,
+                room_type=_choice(f"{prefix}.room_type", entry.get("room_type"), ibilik.ROOM_TYPES),
+                bathroom_type=_choice(
+                    f"{prefix}.bathroom_type",
+                    entry.get("bathroom_type"),
+                    ibilik.BATHROOM_TYPES,
+                ),
+                unit_type=_choice(f"{prefix}.unit_type", entry.get("unit_type"), ibilik.UNIT_TYPES),
+                floor_level=_choice(
+                    f"{prefix}.floor_level", entry.get("floor_level"), ibilik.FLOOR_LEVELS
+                ),
+                min_sqft=_whole_number(f"{prefix}.min_sqft", entry.get("min_sqft"), 0, 10_000_000),
+                max_sqft=_whole_number(f"{prefix}.max_sqft", entry.get("max_sqft"), 0, 10_000_000),
+                kyc_verified=kyc,
+                amenities=_parse_ibilik_amenities(f"{prefix}.amenities", entry.get("amenities")),
+            )
+        )
+    return tuple(searches)
+
+
+def _parse_ibilik(raw_ibilik, *, default_poll: float) -> IbilikConfig | None:
+    if raw_ibilik is None:
+        return None
+    if not isinstance(raw_ibilik, dict):
+        raise ConfigError("ibilik must be a JSON object")
+    allowed = {
+        "enabled",
+        "searches",
+        "poll_interval_seconds",
+        "freshness_hours",
+        "max_pages_per_search",
+        "limit_per_page",
+        "page_pacing_seconds",
+        "search_timeout_seconds",
+        "initial_seed",
+    }
+    unknown = set(raw_ibilik) - allowed
+    if unknown:
+        raise ConfigError(f"ibilik has unknown keys: {', '.join(sorted(unknown))}")
+    enabled = raw_ibilik.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ConfigError("ibilik.enabled must be true or false")
+    if not enabled:
+        return None
+
+    searches = _parse_ibilik_searches(raw_ibilik.get("searches"))
+    poll = _required_number(
+        "ibilik.poll_interval_seconds",
+        raw_ibilik.get("poll_interval_seconds", default_poll),
+        MIN_POLL_SECONDS,
+        24 * 3600.0,
+    )
+    freshness = _required_number(
+        "ibilik.freshness_hours",
+        raw_ibilik.get("freshness_hours", DEFAULT_IBILIK_FRESHNESS_HOURS),
+        1.0,
+        MAX_IBILIK_FRESHNESS_HOURS,
+    )
+    max_pages = _required_int(
+        "ibilik.max_pages_per_search",
+        raw_ibilik.get("max_pages_per_search", DEFAULT_IBILIK_PAGES_PER_SEARCH),
+        1,
+        MAX_IBILIK_PAGES_PER_SEARCH,
+    )
+    limit = _required_int(
+        "ibilik.limit_per_page",
+        raw_ibilik.get("limit_per_page", DEFAULT_IBILIK_LIMIT),
+        1,
+        MAX_IBILIK_LIMIT,
+    )
+    pacing = _required_number(
+        "ibilik.page_pacing_seconds",
+        raw_ibilik.get("page_pacing_seconds", DEFAULT_PAGE_PACING_SECONDS),
+        0.0,
+        MAX_PAGE_PACING_SECONDS,
+    )
+    timeout = _required_number(
+        "ibilik.search_timeout_seconds",
+        raw_ibilik.get("search_timeout_seconds", DEFAULT_SEARCH_TIMEOUT),
+        1.0,
+        MAX_SEARCH_TIMEOUT,
+    )
+    initial_seed = raw_ibilik.get("initial_seed", True)
+    if not isinstance(initial_seed, bool):
+        raise ConfigError("ibilik.initial_seed must be true or false")
+
+    return IbilikConfig(
+        searches=searches,
+        poll_interval_seconds=poll,
+        freshness_hours=freshness,
+        max_pages_per_search=max_pages,
+        limit_per_page=limit,
+        page_pacing_seconds=pacing,
+        search_timeout_seconds=timeout,
+        initial_seed=initial_seed,
+    )
+
+
 def parse_config(raw: dict, *, base_dir: Path) -> AlertConfig:
     if not isinstance(raw, dict):
         raise ConfigError("config root must be a JSON object")
@@ -745,7 +1143,10 @@ def parse_config(raw: dict, *, base_dir: Path) -> AlertConfig:
             "remove it so one database always maps to one singleton lock"
         )
 
-    keywords = _parse_keywords(raw.get("keywords"))
+    # Keywords stay optional only when an iBilik block carries the work. An
+    # explicit empty list is still rejected, matching the old contract.
+    raw_keywords = raw.get("keywords")
+    keywords = () if raw_keywords is None else _parse_keywords(raw_keywords)
 
     poll = _required_number(
         "poll_interval_seconds",
@@ -796,6 +1197,12 @@ def parse_config(raw: dict, *, base_dir: Path) -> AlertConfig:
     base_dir = Path(base_dir).resolve()
     database_path = _resolve_path(raw.get("database_path"), base_dir, "mudah_alerts.db")
 
+    ibilik_config = _parse_ibilik(raw.get("ibilik"), default_poll=poll)
+    if not keywords and ibilik_config is None:
+        raise ConfigError(
+            "config must define Mudah keywords and/or an enabled ibilik block"
+        )
+
     return AlertConfig(
         keywords=keywords,
         database_path=database_path,
@@ -807,6 +1214,7 @@ def parse_config(raw: dict, *, base_dir: Path) -> AlertConfig:
         max_pages_per_keyword=max_pages,
         page_pacing_seconds=pacing,
         search_timeout_seconds=timeout,
+        ibilik=ibilik_config,
     )
 
 
@@ -840,6 +1248,51 @@ def load_config(path=None) -> AlertConfig:
     except OSError as err:
         raise ConfigError(f"could not read {source}: {err}") from err
     return parse_config(raw, base_dir=source.parent)
+
+
+def load_dotenv(path, *, environ=None) -> list[str]:
+    """Load simple ``KEY=VALUE`` pairs from a ``.env`` file, stdlib only.
+
+    Real environment variables always win: a key already present in the target
+    mapping is left untouched, and ``.env`` only fills what is unset. Only the
+    first ``=`` splits a line, so values may contain ``=``. Blank lines and
+    ``#`` comments are ignored, a leading ``export `` is tolerated, and a value
+    wrapped in matching single or double quotes is unwrapped. There is no
+    interpolation and no third-party dependency.
+
+    Returns the list of key *names* that were set, never their values, so callers
+    can report progress without disclosing secrets. A missing file is a no-op.
+    """
+
+    target = os.environ if environ is None else environ
+    loaded: list[str] = []
+    source = Path(path)
+    if not source.is_file():
+        return loaded
+    try:
+        text = source.read_text(encoding="utf-8")
+    except OSError:
+        return loaded
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if key in target:
+            continue
+        target[key] = value
+        loaded.append(key)
+    return loaded
 
 
 # --------------------------------------------------------------------------
@@ -953,6 +1406,194 @@ class SentStore:
             self._conn = None
 
     def __enter__(self) -> "SentStore":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+def _missing_table(err: sqlite3.Error) -> bool:
+    return "no such table" in str(err).lower()
+
+
+class IbilikSentStore:
+    """SQLite state for iBilik searches, in its own tables.
+
+    Kept separate from :class:`SentStore` so iBilik UUIDs never collide with
+    Mudah ids and an existing Mudah database upgrades in place without its rows
+    being touched. A row counts as known once it is seeded or sent; a failed row
+    keeps both timestamps null so the next cycle retries it.
+    """
+
+    def __init__(self, path, *, read_only: bool = False):
+        self.path = Path(path)
+        self.read_only = read_only
+        self._conn: sqlite3.Connection | None = None
+        if read_only:
+            if self.path.exists():
+                target = self.path.resolve().as_posix()
+                self._conn = sqlite3.connect(f"file:{target}?mode=ro", uri=True)
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(str(self.path))
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.executescript(DB_IBILIK_SCHEMA)
+            self._conn.commit()
+
+    def _require_writable(self) -> sqlite3.Connection:
+        if self._conn is None or self.read_only:
+            raise AlertsError("store is read-only")
+        return self._conn
+
+    def known_ids(self) -> set[str]:
+        """Listing ids already seeded or delivered for any iBilik search.
+
+        Read errors propagate; treating a failed read as "nothing known" would
+        re-send listings that were already delivered or suppressed. The one
+        exception is a read-only store on a database that predates the iBilik
+        tables: absent tables mean no iBilik state, not corruption.
+        """
+
+        if self._conn is None:
+            return set()
+        try:
+            rows = self._conn.execute(
+                "SELECT listing_id FROM ibilik_sent "
+                "WHERE seeded_at IS NOT NULL OR sent_at IS NOT NULL"
+            )
+        except sqlite3.OperationalError as err:
+            if self.read_only and _missing_table(err):
+                return set()
+            raise
+        return {str(row[0]) for row in rows}
+
+    def is_sent(self, search_name: str, listing_id: str) -> bool:
+        if self._conn is None:
+            return False
+        row = self._conn.execute(
+            "SELECT 1 FROM ibilik_sent WHERE search_name = ? AND listing_id = ? "
+            "AND sent_at IS NOT NULL",
+            (search_name, listing_id),
+        ).fetchone()
+        return row is not None
+
+    def initialized_searches(self) -> set[str]:
+        if self._conn is None:
+            return set()
+        try:
+            rows = self._conn.execute(
+                "SELECT search_name FROM ibilik_searches WHERE initialized_at IS NOT NULL"
+            )
+        except sqlite3.OperationalError as err:
+            if self.read_only and _missing_table(err):
+                return set()
+            raise
+        return {str(row[0]) for row in rows}
+
+    def seed_search(
+        self,
+        search_name: str,
+        rows: list[tuple[dict, datetime | None]],
+        now_iso: str,
+    ) -> None:
+        """Record a whole search's current listings and mark it initialised.
+
+        One transaction: a partial seed cannot survive a failure, so the next
+        cycle re-seeds the search from a clean slate.
+        """
+
+        conn = self._require_writable()
+        with conn:
+            for item, published_at in rows:
+                conn.execute(
+                    "INSERT OR IGNORE INTO ibilik_sent"
+                    "(search_name, listing_id, keyword, url, title, price,"
+                    " published_at, first_seen_at, seeded_at, sent_at, failure_count) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0)",
+                    (
+                        search_name,
+                        item.get("id"),
+                        search_name,
+                        item.get("url"),
+                        item.get("title"),
+                        item.get("price"),
+                        published_at.isoformat() if published_at else None,
+                        now_iso,
+                        now_iso,
+                    ),
+                )
+            conn.execute(
+                "INSERT INTO ibilik_searches(search_name, initialized_at) "
+                "VALUES(?, ?) "
+                "ON CONFLICT(search_name) DO UPDATE SET initialized_at = excluded.initialized_at",
+                (search_name, now_iso),
+            )
+
+    def upsert_candidate(
+        self,
+        *,
+        search_name: str,
+        listing_id: str,
+        item: dict,
+        published_at: datetime | None,
+        now_iso: str,
+    ) -> None:
+        conn = self._require_writable()
+        with conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO ibilik_sent"
+                "(search_name, listing_id, keyword, url, title, price,"
+                " published_at, first_seen_at, seeded_at, sent_at, failure_count) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0)",
+                (
+                    search_name,
+                    listing_id,
+                    search_name,
+                    item.get("url"),
+                    item.get("title"),
+                    item.get("price"),
+                    published_at.isoformat() if published_at else None,
+                    now_iso,
+                ),
+            )
+
+    def mark_sent(self, search_name: str, listing_id: str, now_iso: str) -> None:
+        conn = self._require_writable()
+        with conn:
+            conn.execute(
+                "UPDATE ibilik_sent SET sent_at = ?, last_attempt_at = ?, "
+                "last_error = NULL WHERE search_name = ? AND listing_id = ?",
+                (now_iso, now_iso, search_name, listing_id),
+            )
+
+    def mark_failure(
+        self, search_name: str, listing_id: str, error: str | None, now_iso: str
+    ) -> None:
+        conn = self._require_writable()
+        with conn:
+            conn.execute(
+                "UPDATE ibilik_sent SET failure_count = failure_count + 1, "
+                "last_error = ?, last_attempt_at = ? "
+                "WHERE search_name = ? AND listing_id = ?",
+                (error, now_iso, search_name, listing_id),
+            )
+
+    def failure_count(self, search_name: str, listing_id: str) -> int:
+        if self._conn is None:
+            return 0
+        row = self._conn.execute(
+            "SELECT failure_count FROM ibilik_sent "
+            "WHERE search_name = ? AND listing_id = ?",
+            (search_name, listing_id),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def close(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+    def __enter__(self) -> "IbilikSentStore":
         return self
 
     def __exit__(self, *exc) -> None:
@@ -1391,6 +2032,386 @@ def _retry_after_seconds(value) -> float | None:
 
 
 # --------------------------------------------------------------------------
+# iBilik service
+# --------------------------------------------------------------------------
+
+_IBILIK_FETCH_ERRORS = (
+    ibilik.IbilikError,
+    urllib.error.HTTPError,
+    urllib.error.URLError,
+    TimeoutError,
+    OSError,
+    ValueError,
+    TypeError,
+    AttributeError,
+    KeyError,
+)
+
+
+def _default_ibilik_search(search: IbilikSearch, *, page: int, limit: int, timeout: float) -> dict:
+    """Fetch and normalise one iBilik page via the shared finder client."""
+
+    return ibilik.search_page(
+        search.as_filters(), page=page, limit=limit, timeout=timeout
+    )
+
+
+@dataclass
+class IbilikCycleReport:
+    started_at: datetime
+    finished_at: datetime | None = None
+    searches_searched: int = 0
+    pages_fetched: int = 0
+    listings_seen: int = 0
+    fresh_candidates: int = 0
+    seeded: list[str] = field(default_factory=list)
+    seeded_count: int = 0
+    would_seed: list[str] = field(default_factory=list)
+    sent: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
+    would_send: list[str] = field(default_factory=list)
+    skipped_stale: int = 0
+    skipped_invalid_timestamp: int = 0
+    skipped_over_price: int = 0
+    skipped_missing_price: int = 0
+    skipped_invalid_url: int = 0
+    errors: list[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        return (
+            f"searches={self.searches_searched} pages={self.pages_fetched} "
+            f"seen={self.listings_seen} candidates={self.fresh_candidates} "
+            f"seeded={len(self.seeded)} would_seed={len(self.would_seed)} "
+            f"sent={len(self.sent)} failed={len(self.failed)} "
+            f"would_send={len(self.would_send)} errors={len(self.errors)} "
+            f"stale={self.skipped_stale} bad_time={self.skipped_invalid_timestamp} "
+            f"over_price={self.skipped_over_price} no_price={self.skipped_missing_price} "
+            f"bad_url={self.skipped_invalid_url}"
+        )
+
+
+class IbilikAlertService:
+    """One polling service over the opt-in iBilik searches.
+
+    Runs independently of the Mudah service: state is in its own tables, a
+    fetch failure only fails that search (or halts iBilik on a 429), and it can
+    operate with no Mudah keywords and no ``MUDAH_AUTOMATION_ALLOWED``.
+    """
+
+    def __init__(
+        self,
+        config: IbilikConfig,
+        *,
+        search=None,
+        sender=None,
+        store: IbilikSentStore | None = None,
+        sleep=time.sleep,
+        now=None,
+        jitter=None,
+        logger=None,
+        dry_run: bool = False,
+    ):
+        self.config = config
+        self.search = search or _default_ibilik_search
+        self.sender = sender
+        self.store = store
+        self.sleep = sleep
+        self.now = now or (lambda: datetime.now(timezone.utc))
+        self._jitter = jitter or (lambda span: random.uniform(0.0, span))
+        self.log = logger or logging.getLogger("mudah_alerts.ibilik")
+        self.dry_run = dry_run
+        self._consecutive_failures = 0
+        self._telegram_retry_after = 0.0
+        self._provider_retry_after = 0.0
+        self._known_ids: set[str] = set()
+        self._initialized: set[str] = set()
+        self._cycle_ids: set[str] = set()
+        self._cycle_halted = False
+        self._telegram_halted = False
+
+    def _freshness_hours(self) -> float:
+        return min(self.config.freshness_hours, MAX_IBILIK_FRESHNESS_HOURS)
+
+    def _iter_pages(self, search: IbilikSearch):
+        """Yield ``(page, result)`` for one search, pausing between pages.
+
+        The caller consumes each page before the next request, so a later-page
+        failure cannot discard results already delivered.
+        """
+
+        for page in range(1, self.config.max_pages_per_search + 1):
+            result = self.search(
+                search,
+                page=page,
+                limit=self.config.limit_per_page,
+                timeout=self.config.search_timeout_seconds,
+            )
+            yield page, result
+            pagination = result.get("pagination") or {}
+            if not pagination.get("has_next"):
+                return
+            self.sleep(self.config.page_pacing_seconds)
+
+    def _record_provider_error(self, err: Exception) -> None:
+        headers = getattr(err, "headers", None)
+        if headers is None:
+            return
+        try:
+            value = headers.get("Retry-After")
+        except AttributeError:
+            return
+        seconds = _retry_after_seconds(value)
+        if seconds:
+            self._provider_retry_after = max(self._provider_retry_after, seconds)
+
+    def _seed_search(self, search: IbilikSearch, report: IbilikCycleReport) -> None:
+        """Fetch every page first, then seed in one transaction.
+
+        Nothing is written until every page of the search has been fetched, so
+        a partial fetch leaves the search uninitialised instead of silently
+        hiding the listings that were missed.
+        """
+
+        items: list[dict] = []
+        seen: set[str] = set()
+        for _page, result in self._iter_pages(search):
+            report.pages_fetched += 1
+            for item in result.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                listing_id = item.get("id")
+                if not listing_id or listing_id in seen:
+                    continue
+                seen.add(listing_id)
+                items.append(item)
+
+        if self.dry_run:
+            report.would_seed.append(search.name)
+            report.seeded_count += len(items)
+            return
+        if self.store is None:
+            raise AlertsError("a writable store is required to seed iBilik searches")
+
+        now = self.now()
+        now_iso = now.astimezone(timezone.utc).isoformat()
+        rows = [(item, listing_published_at(item, now=now)) for item in items]
+        try:
+            self.store.seed_search(search.name, rows, now_iso)
+        except sqlite3.Error as err:
+            self._halt_on_state_error(report, search.name, err)
+            return
+        self._initialized.add(search.name)
+        self._known_ids.update(seen)
+        report.seeded.append(search.name)
+        report.seeded_count += len(seen)
+        self.log.info("seeded %d iBilik listing(s) for %r (no alerts)", len(seen), search.name)
+
+    def _process_page(
+        self, search: IbilikSearch, items: list[dict], report: IbilikCycleReport
+    ) -> None:
+        now = self.now()
+        for item in items:
+            report.listings_seen += 1
+            if not isinstance(item, dict):
+                continue
+            listing_id = item.get("id")
+            if not listing_id or listing_id in self._cycle_ids or listing_id in self._known_ids:
+                continue
+            published = listing_published_at(item, now=now)
+            if published is None:
+                report.skipped_invalid_timestamp += 1
+                continue
+            if not is_fresh(published, now=now, freshness_hours=self._freshness_hours()):
+                report.skipped_stale += 1
+                continue
+            price = _numeric_price(item.get("price"))
+            if price is None:
+                report.skipped_missing_price += 1
+                continue
+            if search.max_price is not None and price > search.max_price:
+                report.skipped_over_price += 1
+                continue
+            self._cycle_ids.add(listing_id)
+            self._deliver_one(
+                search,
+                Candidate(
+                    listing_id=listing_id,
+                    keyword=search.name,
+                    item=item,
+                    published_at=published,
+                ),
+                report,
+            )
+            if self._cycle_halted:
+                return
+
+    def _deliver_one(
+        self, search: IbilikSearch, candidate: Candidate, report: IbilikCycleReport
+    ) -> None:
+        if self._telegram_halted or self._cycle_halted:
+            return
+        if candidate.listing_id in self._known_ids:
+            return
+        if self.dry_run:
+            report.would_send.append(candidate.listing_id)
+            self._known_ids.add(candidate.listing_id)
+            return
+
+        current = self.now()
+        if not is_fresh(
+            candidate.published_at, now=current, freshness_hours=self._freshness_hours()
+        ):
+            report.skipped_stale += 1
+            return
+
+        if self.store is None:
+            raise AlertsError("a writable store is required to send alerts")
+        sender = self.sender
+        if sender is None:
+            raise AlertsError("a Telegram sender is required to send alerts")
+
+        message = build_ibilik_message(
+            candidate.item, published_at=candidate.published_at, now=current
+        )
+        if message is None:
+            report.skipped_invalid_url += 1
+            self.log.warning(
+                "iBilik listing %s has no usable alert payload; skipping",
+                candidate.listing_id,
+            )
+            return
+
+        now_iso = current.astimezone(timezone.utc).isoformat()
+        try:
+            self.store.upsert_candidate(
+                search_name=search.name,
+                listing_id=candidate.listing_id,
+                item=candidate.item,
+                published_at=candidate.published_at,
+                now_iso=now_iso,
+            )
+        except sqlite3.Error as err:
+            self._halt_on_state_error(report, candidate.listing_id, err)
+            return
+
+        result = sender.send(message)
+        if result.ok:
+            try:
+                self.store.mark_sent(search.name, candidate.listing_id, now_iso)
+            except sqlite3.Error as err:
+                self._halt_on_state_error(report, candidate.listing_id, err)
+                return
+            self._known_ids.add(candidate.listing_id)
+            report.sent.append(candidate.listing_id)
+            self.log.info("sent iBilik alert for listing %s", candidate.listing_id)
+            return
+
+        try:
+            self.store.mark_failure(search.name, candidate.listing_id, result.error, now_iso)
+        except sqlite3.Error as err:
+            self._halt_on_state_error(report, candidate.listing_id, err)
+            return
+        report.failed.append(candidate.listing_id)
+        self.log.warning(
+            "telegram send failed for iBilik %s: %s", candidate.listing_id, result.error
+        )
+        if result.rate_limited or result.retry_after is not None:
+            cooldown = (
+                result.retry_after
+                if result.retry_after is not None
+                else TELEGRAM_429_DEFAULT_COOLDOWN
+            )
+            self._telegram_retry_after = max(self._telegram_retry_after, cooldown)
+            self._telegram_halted = True
+            self.log.warning(
+                "telegram rate limited; stopping iBilik sends this cycle for %.0fs",
+                cooldown,
+            )
+
+    def _halt_on_state_error(
+        self, report: IbilikCycleReport, listing_id: str, err: sqlite3.Error
+    ) -> None:
+        report.errors.append(f"state write failed for {listing_id}: {err}")
+        self.log.error("could not write iBilik state for %s: %s", listing_id, err)
+        self._cycle_halted = True
+
+    def run_cycle(self) -> IbilikCycleReport:
+        report = IbilikCycleReport(started_at=self.now())
+        if self.store is not None:
+            try:
+                self._known_ids = self.store.known_ids()
+                self._initialized = self.store.initialized_searches()
+            except sqlite3.Error as err:
+                self._consecutive_failures += 1
+                report.errors.append(f"state read failed: {err}")
+                self.log.error(
+                    "could not read iBilik state; skipping sends this cycle: %s", err
+                )
+                report.finished_at = self.now()
+                return report
+
+        self._cycle_ids = set()
+        self._cycle_halted = False
+        self._telegram_halted = False
+        cycle_failed = False
+        provider_halted = False
+
+        searches = list(self.config.searches)
+        for index, search in enumerate(searches):
+            if provider_halted or self._cycle_halted or self._telegram_halted:
+                break
+            try:
+                if self.config.initial_seed and search.name not in self._initialized:
+                    self._seed_search(search, report)
+                else:
+                    for _page, result in self._iter_pages(search):
+                        report.pages_fetched += 1
+                        self._process_page(search, result.get("items") or [], report)
+                        if self._cycle_halted or self._telegram_halted:
+                            break
+            except _IBILIK_FETCH_ERRORS as err:
+                cycle_failed = True
+                report.errors.append(f"{search.name}: {err}")
+                self._record_provider_error(err)
+                self.log.warning("iBilik search %r failed: %s", search.name, err)
+                if isinstance(err, urllib.error.HTTPError) and err.code == 429:
+                    provider_halted = True
+            else:
+                report.searches_searched += 1
+            if (
+                index < len(searches) - 1
+                and not provider_halted
+                and not self._cycle_halted
+                and not self._telegram_halted
+            ):
+                self.sleep(self.config.page_pacing_seconds)
+
+        if cycle_failed:
+            self._consecutive_failures += 1
+        else:
+            self._consecutive_failures = 0
+        report.fresh_candidates = len(self._cycle_ids)
+        report.finished_at = self.now()
+        return report
+
+    def next_delay(self) -> float:
+        """Seconds to wait before the next poll, with backoff when unhealthy."""
+
+        delay = self.config.poll_interval_seconds
+        if self._consecutive_failures:
+            exponent = min(self._consecutive_failures - 1, 16)
+            backoff = min(BACKOFF_BASE_SECONDS * (2**exponent), BACKOFF_CAP_SECONDS)
+            delay = max(delay, backoff) + self._jitter(backoff * 0.25)
+        if self._provider_retry_after:
+            delay = max(delay, self._provider_retry_after)
+            self._provider_retry_after = 0.0
+        if self._telegram_retry_after:
+            delay = max(delay, self._telegram_retry_after + 1.0)
+            self._telegram_retry_after = 0.0
+        return delay
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -1399,8 +2420,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mudah_alerts.py",
         description=(
-            "Poll permission-gated Mudah keyword searches and alert Telegram "
-            "about fresh listings."
+            "Poll Mudah and iBilik rental searches (each on its own cadence) and "
+            "alert Telegram about fresh listings. When Mudah is not authorised, "
+            "its searches are skipped and iBilik keeps polling."
         ),
     )
     parser.add_argument(
@@ -1434,6 +2456,155 @@ def _automation_allowed() -> bool:
     return os.environ.get("MUDAH_AUTOMATION_ALLOWED", "").strip() == "1"
 
 
+def _mudah_gate_required(config: AlertConfig) -> bool:
+    """The Mudah permission gate applies only when Mudah keywords are set.
+
+    An iBilik-only config uses the public iBilik API, so it must not be blocked
+    by a flag that only exists because of Mudah's robots.txt terms.
+    """
+
+    return bool(config.keywords)
+
+
+def _apply_mudah_gate(
+    config: AlertConfig, *, allowed: bool, logger=None
+) -> AlertConfig:
+    """Drop Mudah keywords when automation has not been authorised.
+
+    This keeps a combined config useful: iBilik uses a public API and is not
+    gated, so its searches keep polling while Mudah is skipped with a clear
+    warning. A Mudah-only config becomes providerless and ``main`` reports that
+    nothing can run. The standalone Mudah finder keeps its own hard gate.
+    """
+
+    if allowed or not config.keywords:
+        return config
+    log = logger or logging.getLogger("mudah_alerts")
+    log.warning(
+        "MUDAH_AUTOMATION_ALLOWED is not 1; skipping Mudah searches "
+        "(robots.txt authorisation required). iBilik keeps polling if configured."
+    )
+    return replace(config, keywords=())
+
+
+def _run_dry(config: AlertConfig, log: logging.Logger) -> int:
+    """Report matches for every configured provider without writing state."""
+
+    if config.keywords:
+        with SentStore(config.database_path, read_only=True) as store:
+            report = AlertService(config, store=store, dry_run=True).run_cycle()
+        log.info("mudah dry run: %s", report.summary())
+        for listing_id in report.would_send:
+            log.info("would send %s", listing_id)
+        for error in report.errors:
+            log.warning("mudah search error: %s", error)
+
+    if config.ibilik is not None:
+        with IbilikSentStore(config.database_path, read_only=True) as store:
+            report = IbilikAlertService(
+                config.ibilik, store=store, dry_run=True
+            ).run_cycle()
+        log.info("ibilik dry run: %s", report.summary())
+        for search_name in report.would_seed:
+            log.info("would seed iBilik search %s", search_name)
+        for listing_id in report.would_send:
+            log.info("would send iBilik %s", listing_id)
+        for error in report.errors:
+            log.warning("iBilik search error: %s", error)
+    return 0
+
+
+def _build_services(config: AlertConfig, sender) -> tuple[list, list]:
+    """Create the stores and services for every configured provider.
+
+    Returns ``(stores, services)``; callers close the stores when done. Each
+    provider gets its own store so their dedupe state stays independent.
+    """
+
+    stores: list = []
+    services: list = []
+    if config.keywords:
+        store = SentStore(config.database_path)
+        stores.append(store)
+        services.append(AlertService(config, sender=sender, store=store))
+    if config.ibilik is not None:
+        ibilik_store = IbilikSentStore(config.database_path)
+        stores.append(ibilik_store)
+        services.append(
+            IbilikAlertService(config.ibilik, sender=sender, store=ibilik_store)
+        )
+    return stores, services
+
+
+def _run_once(services, log: logging.Logger) -> int:
+    """Run one cycle per provider, containing an unexpected crash.
+
+    Expected provider errors are already turned into reports inside
+    ``run_cycle``. Anything that escapes is unexpected, so it is logged here
+    without stopping the remaining providers, and the caller gets a nonzero
+    code to tell a partial run from a clean one.
+    """
+
+    exit_code = 0
+    for service in services:
+        try:
+            report = service.run_cycle()
+            log.info("%s once: %s", type(service).__name__, report.summary())
+        except Exception as err:  # noqa: BLE001 - isolate providers from each other
+            exit_code = 1
+            log.error("%s once crashed: %s", type(service).__name__, err)
+    return exit_code
+
+
+def _run_services_forever(
+    services,
+    stop_event: threading.Event,
+    log: logging.Logger,
+    *,
+    monotonic=time.monotonic,
+) -> None:
+    """Poll each provider against its own monotonic due time.
+
+    Every provider holds a due time. The loop runs whichever providers are due
+    now, then sleeps until the earliest next due time, so a long backoff on one
+    provider never delays a healthy one and the wait is never a hot loop. No
+    threads are used, and ``stop_event`` breaks the wait promptly.
+    """
+
+    if not services:
+        return
+
+    schedule = [(service, monotonic()) for service in services]
+    while not stop_event.is_set():
+        now = monotonic()
+        summaries: list[str] = []
+        for index, (service, due) in enumerate(schedule):
+            if due > now:
+                continue
+            try:
+                report = service.run_cycle()
+                summaries.append(f"{type(service).__name__}: {report.summary()}")
+            except Exception as err:  # noqa: BLE001 - isolate providers from each other
+                log.error("provider cycle crashed: %s", err)
+            try:
+                delay = service.next_delay()
+            except Exception as err:  # noqa: BLE001 - a delay bug must not wedge the loop
+                log.error("could not compute next delay: %s", err)
+                delay = DEFAULT_POLL_SECONDS
+            schedule[index] = (service, monotonic() + max(0.0, delay))
+        next_due = min(due for _service, due in schedule)
+        wait = next_due - monotonic()
+        if wait <= 0:
+            # Only reachable from a zero-length delay; keep the loop bounded.
+            wait = MIN_SCHEDULE_WAIT
+        if summaries:
+            log.info(
+                "cycle done: %s; next poll in %.1fs", "; ".join(summaries), wait
+            )
+        if stop_event.wait(wait):
+            break
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(
@@ -1449,23 +2620,19 @@ def main(argv=None) -> int:
         log.error("configuration error: %s", err)
         return 2
 
-    if not _automation_allowed():
+    # Mudah's permission gate only removes the Mudah side; iBilik is a public
+    # API and keeps polling. A Mudah-only config with the gate off has nothing
+    # left to run, so fail closed with a clear message.
+    config = _apply_mudah_gate(config, allowed=_automation_allowed(), logger=log)
+    if not config.keywords and config.ibilik is None:
         log.error(
-            "MUDAH_AUTOMATION_ALLOWED=1 is required. Mudah's robots.txt says "
-            "automated access needs permission; set it only after authorisation."
+            "nothing to poll: Mudah is disabled (MUDAH_AUTOMATION_ALLOWED is not "
+            "1) and no iBilik block is configured."
         )
         return 2
 
     if args.dry_run:
-        with SentStore(config.database_path, read_only=True) as store:
-            service = AlertService(config, store=store, dry_run=True)
-            report = service.run_cycle()
-        log.info("dry run: %s", report.summary())
-        for listing_id in report.would_send:
-            log.info("would send %s", listing_id)
-        for error in report.errors:
-            log.warning("search error: %s", error)
-        return 0
+        return _run_dry(config, log)
 
     try:
         sender = sender_from_env(timeout=config.search_timeout_seconds)
@@ -1480,7 +2647,8 @@ def main(argv=None) -> int:
         log.error("%s", err)
         return 3
 
-    store = SentStore(config.database_path)
+    stores: list = []
+    services: list = []
     stop_event = threading.Event()
 
     def _handle_signal(signum, _frame):
@@ -1494,19 +2662,20 @@ def main(argv=None) -> int:
             except (ValueError, OSError):
                 pass
 
+    exit_code = 0
     try:
-        service = AlertService(config, sender=sender, store=store)
+        stores, services = _build_services(config, sender)
         if args.once:
-            report = service.run_cycle()
-            log.info("once: %s", report.summary())
+            exit_code = _run_once(services, log)
         else:
-            service.run_forever(stop_event)
+            _run_services_forever(services, stop_event, log)
     except KeyboardInterrupt:
         log.info("interrupted")
     finally:
-        store.close()
+        for store in stores:
+            store.close()
         lock.release()
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

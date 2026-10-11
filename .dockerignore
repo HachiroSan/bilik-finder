@@ -5,6 +5,8 @@
 !Dockerfile
 !mudah-finder
 !mudah-finder/mudah.py
+!ibilik-finder
+!ibilik-finder/ibilik.py
 !mudah-alerts
 !mudah-alerts/mudah_alerts.py
 

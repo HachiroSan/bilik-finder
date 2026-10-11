@@ -19,13 +19,15 @@ jobs:
         run: py --version
 
       - name: Compile all Python sources
-        run: py -m compileall -q mudah-alerts mudah-finder ibilik-finder
+        run: py -m compileall -q mudah-alerts mudah-finder ibilik-finder run_alerts.py
 
       - name: Install finder test dependency
         run: py -m pip install --disable-pip-version-check -r mudah-finder/requirements-mcp.txt
 
       # Run each directory separately so the two mcp_server.py modules never
       # collide and each test module imports from its own working directory.
+      # The alerts step discovers both test_mudah_alerts.py and
+      # test_ibilik_alerts.py.
       - name: Alerts tests (offline)
         working-directory: mudah-alerts
         run: py -m unittest discover -v

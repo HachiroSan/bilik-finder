@@ -610,6 +610,106 @@ def build_search_params(args, page: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Reusable search helpers (shared by the CLI, MCP server, and alert service)
+# ---------------------------------------------------------------------------
+
+SEARCH_PATH = "/api/v1/client/listings/room-rentals"
+DEFAULT_PAGE_LIMIT = 100
+
+
+def filters_to_params(
+    filters: dict,
+    *,
+    page: int = 1,
+    limit: int = DEFAULT_PAGE_LIMIT,
+    sort_by: str = "published_at",
+    sort_direction: str = "desc",
+) -> dict:
+    """Build the query mapping for the room-rental search endpoint.
+
+    ``filters`` uses the same keys the CLI exposes: ``query``, ``state``,
+    ``city``, ``area``, ``min_price``, ``max_price``, ``room_type``,
+    ``bathroom_type``, ``unit_type``, ``floor_level``, ``min_sqft``,
+    ``max_sqft``, ``kyc_verified`` and ``amenities``. Missing or falsy values
+    simply omit that filter.
+    """
+    params: dict = {
+        "limit": limit,
+        "page": page,
+        "sortBy": sort_by,
+        "sortDirection": sort_direction,
+    }
+    if filters.get("query"):
+        params["filter[search]"] = filters["query"]
+    if filters.get("state"):
+        params["filter[state]"] = filters["state"]
+    if filters.get("city"):
+        params["filter[city]"] = filters["city"]
+    if filters.get("area"):
+        params["filter[area]"] = filters["area"]
+    if filters.get("min_price") is not None:
+        params["filter[minPrice]"] = filters["min_price"]
+    if filters.get("max_price") is not None:
+        params["filter[maxPrice]"] = filters["max_price"]
+    if filters.get("room_type"):
+        params["filter[roomType]"] = filters["room_type"]
+    if filters.get("bathroom_type"):
+        params["filter[bathroomType]"] = filters["bathroom_type"]
+    if filters.get("unit_type"):
+        params["filter[unitType]"] = filters["unit_type"]
+    if filters.get("floor_level"):
+        params["filter[floorLevel]"] = filters["floor_level"]
+    if filters.get("min_sqft") is not None:
+        params["filter[minSpaceSqft]"] = filters["min_sqft"]
+    if filters.get("max_sqft") is not None:
+        params["filter[maxSpaceSqft]"] = filters["max_sqft"]
+    if filters.get("kyc_verified") is not None:
+        params["filter[kycVerified]"] = "true" if filters["kyc_verified"] else "false"
+    if filters.get("amenities"):
+        params["filter[amenities]"] = list(filters["amenities"])
+    return params
+
+
+def search_page(
+    filters: dict,
+    *,
+    page: int = 1,
+    limit: int = DEFAULT_PAGE_LIMIT,
+    timeout: float = 30.0,
+    sort_by: str = "published_at",
+    sort_direction: str = "desc",
+) -> dict:
+    """Fetch one page of room rentals and normalise each item.
+
+    Returns ``{"items": [normalised...], "pagination": {...}}`` where
+    ``has_next`` comes from the API's ``totalPages``. Raises whatever
+    :func:`request_json` raises; callers decide how to react.
+    """
+    params = filters_to_params(
+        filters,
+        page=page,
+        limit=limit,
+        sort_by=sort_by,
+        sort_direction=sort_direction,
+    )
+    data = request_json(SEARCH_PATH, params, timeout)
+    raw_items = data.get("items") or []
+    items = [normalize(item) for item in raw_items if isinstance(item, dict)]
+    pagination = data.get("pagination") or {}
+    total_pages = pagination.get("totalPages") or 0
+    return {
+        "items": items,
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total_items": pagination.get("totalItems") or 0,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: locations
 # ---------------------------------------------------------------------------
 

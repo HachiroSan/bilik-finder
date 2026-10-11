@@ -13,8 +13,8 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
     environment:
-      # Permission stays 0 unless you set it. The service refuses to scrape
-      # until Mudah has authorised you, so accidentally starting it is safe.
+      # Set to 1 only after Mudah has authorised your use. Otherwise Mudah is
+      # skipped while iBilik continues polling.
       MUDAH_AUTOMATION_ALLOWED: "${MUDAH_AUTOMATION_ALLOWED:-0}"
       # Credentials come from the untracked .env file, never the image.
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"

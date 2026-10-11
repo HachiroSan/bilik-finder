@@ -4,6 +4,10 @@ A small command-line tool for finding rooms on [ibilik.com](https://www.ibilik.c
 via its public client API. No login, no API key, no dependencies beyond the
 Python 3.14 standard library.
 
+The `mudah-alerts` service reuses this module's HTTP and normalisation code for
+opt-in iBilik Telegram alerts; its `watch` state here stays separate and is not
+involved. See `../mudah-alerts/README.md` for the alert config.
+
 It does three things:
 
 - `locations` — turn a place name ("cheras") into the location codes the API needs.

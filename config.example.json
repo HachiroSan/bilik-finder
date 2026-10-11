@@ -1,0 +1,27 @@
+{
+  "poll_interval_seconds": 3600,
+  "freshness_hours": 48,
+  "location": "malaysia",
+  "rental_type": "room",
+  "max_price": 2200,
+  "max_pages_per_keyword": 2,
+  "page_pacing_seconds": 2,
+  "search_timeout_seconds": 30,
+  "database_path": "mudah_alerts.db",
+  "keywords": [
+    {"query": "Platinum Victory 3", "max_price": 1800},
+    {"query": "Putra Villa Condominium"}
+  ],
+  "ibilik": {
+    "enabled": true,
+    "initial_seed": true,
+    "max_pages_per_search": 3,
+    "limit_per_page": 100,
+    "page_pacing_seconds": 2,
+    "search_timeout_seconds": 30,
+    "searches": [
+      {"name": "cheras-rooms", "city": "cheras", "max_price": 900, "room_type": "MASTER"},
+      {"name": "sunway", "query": "sunway university", "max_price": 1000}
+    ]
+  }
+}

@@ -1,9 +1,10 @@
-# Minimal runtime for the Mudah Telegram alert service.
+# Minimal runtime for the Mudah + iBilik Telegram alert service.
 #
-# The service and its finder dependency are pure standard-library Python, so
+# The service and both finder dependencies are pure standard-library Python, so
 # there is nothing to pip install and no third-party dependency in this image.
-# Only the two modules the service imports are copied, at the relative layout
-# the finder path resolution expects (/app/mudah-alerts and /app/mudah-finder).
+# Only the three modules the service imports are copied, at the relative layout
+# the finder path resolution expects (/app/mudah-alerts, /app/mudah-finder, and
+# /app/ibilik-finder).
 FROM python:3.13-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -17,6 +18,7 @@ RUN useradd --create-home --uid 10001 appuser \
 WORKDIR /app
 
 COPY --chown=appuser:appuser mudah-finder/mudah.py /app/mudah-finder/mudah.py
+COPY --chown=appuser:appuser ibilik-finder/ibilik.py /app/ibilik-finder/ibilik.py
 COPY --chown=appuser:appuser mudah-alerts/mudah_alerts.py /app/mudah-alerts/mudah_alerts.py
 
 USER appuser
