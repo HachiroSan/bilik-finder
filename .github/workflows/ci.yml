@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    # The suites and the finder's stdio test use the Windows `py` launcher, so
+    # run on Windows where that launcher is present.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Show interpreter
+        run: py --version
+
+      - name: Compile all Python sources
+        run: py -m compileall -q mudah-alerts mudah-finder ibilik-finder
+
+      - name: Install finder test dependency
+        run: py -m pip install --disable-pip-version-check -r mudah-finder/requirements-mcp.txt
+
+      # Run each directory separately so the two mcp_server.py modules never
+      # collide and each test module imports from its own working directory.
+      - name: Alerts tests (offline)
+        working-directory: mudah-alerts
+        run: py -m unittest discover -v
+
+      - name: Finder tests (offline)
+        working-directory: mudah-finder
+        run: py -m unittest discover -v

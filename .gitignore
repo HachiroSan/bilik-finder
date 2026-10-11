@@ -1,0 +1,55 @@
+# Secrets and local environment. Never commit real credentials.
+.env
+.env.*
+!.env.example
+
+# Local runtime configuration (keep the *.example.json files)
+config.json
+**/config.json
+config.local.json
+docker-compose.override.yml
+
+# Python caches and bytecode
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# SQLite and runtime state: databases, WAL/SHM sidecars, and lock files
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.db-journal
+*.sqlite-journal
+*.sqlite3-journal
+*.lock
+
+# Agent memory store
+.graymatter/
+
+# Shortlist spreadsheets and generated exports
+*.xlsx
+*.xls
+*shortlist*
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

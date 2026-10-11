@@ -1,0 +1,30 @@
+name: move-to-kl
+
+services:
+  mudah-alerts:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mudah-alerts:local
+    container_name: mudah-alerts
+    # tini reaps children and forwards SIGTERM to the Python process so the
+    # service can finish its current cycle and exit cleanly.
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      # Permission stays 0 unless you set it. The service refuses to scrape
+      # until Mudah has authorised you, so accidentally starting it is safe.
+      MUDAH_AUTOMATION_ALLOWED: "${MUDAH_AUTOMATION_ALLOWED:-0}"
+      # Credentials come from the untracked .env file, never the image.
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID:-}"
+    volumes:
+      # Persistent SQLite state.
+      - alerts-data:/data
+      # Read-only config. database_path inside points at /data.
+      - ./deploy/config.example.json:/config/config.json:ro
+    # No published ports: the service only makes outbound HTTPS calls.
+
+volumes:
+  alerts-data:

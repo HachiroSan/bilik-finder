@@ -1,0 +1,22 @@
+# Deny everything, then allow only what the alert image needs. Keeping the
+# context this small means secrets, databases, and caches are never sent to the
+# Docker daemon or baked into a layer.
+**
+!Dockerfile
+!mudah-finder
+!mudah-finder/mudah.py
+!mudah-alerts
+!mudah-alerts/mudah_alerts.py
+
+# Belt-and-braces exclusions if an allow glob is ever widened.
+.env
+.env.*
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.lock
+__pycache__/
+.graymatter/
+*.xlsx

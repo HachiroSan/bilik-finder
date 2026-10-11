@@ -1,0 +1,15 @@
+{
+  "poll_interval_seconds": 120,
+  "freshness_hours": 48,
+  "location": "malaysia",
+  "rental_type": "room",
+  "max_price": 2200,
+  "max_pages_per_keyword": 2,
+  "page_pacing_seconds": 2,
+  "search_timeout_seconds": 30,
+  "database_path": "/data/mudah_alerts.db",
+  "keywords": [
+    {"query": "Platinum Victory 3", "max_price": 1800},
+    {"query": "Putra Villa Condominium"}
+  ]
+}

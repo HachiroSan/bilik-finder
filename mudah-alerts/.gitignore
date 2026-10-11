@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local runtime state
+mudah_alerts.db
+mudah_alerts.db-wal
+mudah_alerts.db-shm
+*.lock
+
+# Local configuration holds personal search terms
+config.json
+
+.venv/
+venv/
