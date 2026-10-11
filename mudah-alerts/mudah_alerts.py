@@ -496,17 +496,37 @@ def _format_price(price: float) -> str:
     return f"RM {price:,.2f}"
 
 
+def _format_my_time(published: datetime) -> str:
+    """Absolute posting time in Malaysia time, e.g. ``12 Oct 2026, 3:45 PM``."""
+
+    local = _as_utc(published).astimezone(MYT)
+    hour = local.hour % 12 or 12
+    meridiem = "AM" if local.hour < 12 else "PM"
+    return f"{local.day} {local.strftime('%b %Y')}, {hour}:{local.minute:02d} {meridiem}"
+
+
 def _format_posted(published: datetime, now: datetime | None) -> str:
+    """Absolute (MYT) posting time plus a relative age, e.g.
+    ``12 Oct 2026, 3:45 PM (2 h ago)``.
+
+    The absolute half is always present so the reader can see when a listing was
+    posted even when the relative window has aged out; the parenthesised half
+    keeps the at-a-glance freshness that the old format had.
+    """
+
     if now is None:
         now = datetime.now(timezone.utc)
     moment = _as_utc(now)
-    published_utc = _as_utc(published)
-    delta = (moment - published_utc).total_seconds()
-    if delta < 3600:
-        return f"{max(1, int(delta // 60))} min ago"
-    if delta < 86400:
-        return f"{int(delta // 3600)} h ago"
-    return published_utc.astimezone(MYT).strftime("%d %b %Y %H:%M MYT")
+    delta = (moment - _as_utc(published)).total_seconds()
+    if delta < 60:
+        relative = "just now"
+    elif delta < 3600:
+        relative = f"{max(1, int(delta // 60))} min ago"
+    elif delta < 86400:
+        relative = f"{int(delta // 3600)} h ago"
+    else:
+        relative = f"{int(delta // 86400)} d ago"
+    return f"{_format_my_time(published)} ({relative})"
 
 
 def _fit_title(raw: str, reserved: int, limit: int) -> str:
@@ -546,7 +566,7 @@ def build_message(
         return None
 
     raw_title = str(item.get("title") or "Mudah listing").strip() or "Mudah listing"
-    tail = [f"{_format_price(price)}/month"]
+    tail = [f"Mudah · {_format_price(price)}/month"]
     if isinstance(published_at, datetime):
         tail.append(f"Posted {_format_posted(published_at, now)}")
     link = f'<a href="{_escape_html(url)}">Open on Mudah</a>'
@@ -618,7 +638,9 @@ def build_ibilik_message(
         return None
 
     raw_title = str(item.get("title") or "iBilik listing").strip() or "iBilik listing"
-    tail = ["iBilik", f"{_format_price(price)}{_ibilik_price_unit(item.get('charge_unit'))}"]
+    tail = [
+        f"iBilik · {_format_price(price)}{_ibilik_price_unit(item.get('charge_unit'))}"
+    ]
     location = _ibilik_location(item)
     if location:
         tail.append(_escape_html(location))
@@ -762,7 +784,8 @@ class IbilikSearch:
     ``name`` namespaces its dedupe state, so two searches never share rows even
     when they return the same listing. The remaining fields map straight onto
     the documented iBilik filter parameters; location values are iBilik codes
-    such as ``cheras`` or ``selangor``, not display names.
+    such as ``cheras``, ``selangor`` or a property code like ``the-troika``,
+    not display names.
     """
 
     name: str
@@ -770,6 +793,7 @@ class IbilikSearch:
     state: str | None = None
     city: str | None = None
     area: str | None = None
+    property: str | None = None
     min_price: int | None = None
     max_price: int | None = None
     room_type: str | None = None
@@ -787,6 +811,7 @@ class IbilikSearch:
             "state": self.state,
             "city": self.city,
             "area": self.area,
+            "property": self.property,
             "min_price": self.min_price,
             "max_price": self.max_price,
             "room_type": self.room_type,
@@ -933,6 +958,8 @@ _IBILIK_SEARCH_KEYS = {
     "state",
     "city",
     "area",
+    "property",
+    "url",
     "min_price",
     "max_price",
     "room_type",
@@ -998,6 +1025,43 @@ def _parse_ibilik_amenities(name: str, value) -> tuple[str, ...]:
     return tuple(cleaned)
 
 
+_IBILIK_LOCATION_KEYS = {"query", "state", "city", "area", "property"}
+
+
+def _parse_ibilik_search_url(name: str, value) -> dict:
+    """Turn an ibilik.com search URL into an iBilik filter mapping.
+
+    The website encodes filters in the query string: ``?property=``, ``?city=``,
+    ``?area=`` and ``?state=`` map to those filters, and a free-text ``?search=``
+    or ``?q=`` becomes the ``query`` filter. Only an ibilik.com host is
+    accepted, so a pasted URL cannot redirect the fetch somewhere else.
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{name} must be a non-empty iBilik search URL")
+    parts = urllib.parse.urlsplit(value.strip())
+    host = (parts.hostname or "").lower()
+    if parts.scheme not in ("http", "https") or not (
+        host == "ibilik.com" or host.endswith(".ibilik.com")
+    ):
+        raise ConfigError(f"{name} must be an ibilik.com URL")
+    params = urllib.parse.parse_qs(parts.query, keep_blank_values=False)
+    filters: dict = {}
+    for key in ("property", "city", "area", "state"):
+        if key in params and params[key][0].strip():
+            filters[key] = params[key][0].strip()
+    for key in ("search", "q"):
+        if key in params and params[key][0].strip():
+            filters["query"] = params[key][0].strip()
+            break
+    if not filters:
+        raise ConfigError(
+            f"{name} has no supported filter "
+            "(property, city, area, state, or search)"
+        )
+    return filters
+
+
 def _parse_ibilik_searches(raw) -> tuple[IbilikSearch, ...]:
     if not isinstance(raw, list) or not raw:
         raise ConfigError("ibilik.searches must be a non-empty list")
@@ -1018,6 +1082,21 @@ def _parse_ibilik_searches(raw) -> tuple[IbilikSearch, ...]:
             raise ConfigError(f"{prefix}.name duplicates {name!r}")
         names.add(name)
 
+        url_value = entry.get("url")
+        if url_value is not None:
+            conflicting = sorted(set(entry) & _IBILIK_LOCATION_KEYS)
+            if conflicting:
+                raise ConfigError(
+                    f"{prefix}.url cannot be combined with "
+                    + ", ".join(conflicting)
+                )
+            url_filters = _parse_ibilik_search_url(f"{prefix}.url", url_value)
+        else:
+            url_filters = {}
+
+        def _loc(key):
+            return url_filters.get(key) if url_value is not None else entry.get(key)
+
         min_price = _whole_number(f"{prefix}.min_price", entry.get("min_price"), 0, 10_000_000)
         max_price = _whole_number(f"{prefix}.max_price", entry.get("max_price"), 0, 10_000_000)
         if min_price is not None and max_price is not None and min_price > max_price:
@@ -1030,10 +1109,11 @@ def _parse_ibilik_searches(raw) -> tuple[IbilikSearch, ...]:
         searches.append(
             IbilikSearch(
                 name=name,
-                query=_optional_text(f"{prefix}.query", entry.get("query"), 100),
-                state=_location_code(f"{prefix}.state", entry.get("state")),
-                city=_location_code(f"{prefix}.city", entry.get("city")),
-                area=_location_code(f"{prefix}.area", entry.get("area")),
+                query=_optional_text(f"{prefix}.query", _loc("query"), 100),
+                state=_location_code(f"{prefix}.state", _loc("state")),
+                city=_location_code(f"{prefix}.city", _loc("city")),
+                area=_location_code(f"{prefix}.area", _loc("area")),
+                property=_location_code(f"{prefix}.property", _loc("property")),
                 min_price=min_price,
                 max_price=max_price,
                 room_type=_choice(f"{prefix}.room_type", entry.get("room_type"), ibilik.ROOM_TYPES),

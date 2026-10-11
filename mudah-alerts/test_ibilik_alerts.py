@@ -255,6 +255,93 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(disabled.ibilik)
 
 
+class IbilikPropertyAndUrlTests(unittest.TestCase):
+    def _search(self, entry):
+        config = parse_config(
+            {"ibilik": {"searches": [entry]}}, base_dir=Path(".")
+        )
+        assert config.ibilik is not None
+        return config.ibilik.searches[0]
+
+    def test_url_property_becomes_a_property_filter(self):
+        search = self._search(
+            {
+                "name": "troika",
+                "url": "https://www.ibilik.com/room-rentals/search?property=the-troika#results",
+            }
+        )
+        self.assertEqual(search.property, "the-troika")
+        self.assertIsNone(search.query)
+        self.assertIsNone(search.city)
+        self.assertIsNone(search.area)
+        self.assertIsNone(search.state)
+
+    def test_url_city_becomes_a_city_filter(self):
+        search = self._search(
+            {
+                "name": "wangsa",
+                "url": "https://www.ibilik.com/room-rentals/search?city=wangsa-maju",
+            }
+        )
+        self.assertEqual(search.city, "wangsa-maju")
+
+    def test_url_area_becomes_an_area_filter(self):
+        search = self._search(
+            {"name": "klcc", "url": "https://www.ibilik.com/room-rentals/search?area=klcc"}
+        )
+        self.assertEqual(search.area, "klcc")
+
+    def test_explicit_property_key_parses_into_filters(self):
+        search = self._search({"name": "troika", "property": "the-troika"})
+        self.assertEqual(search.property, "the-troika")
+        self.assertEqual(search.as_filters()["property"], "the-troika")
+
+    def test_non_ibilik_url_is_rejected(self):
+        for url in (
+            "https://evil.example/search?property=the-troika",
+            "https://ibilik.com.evil.example/search?city=cheras",
+            "not-a-url",
+        ):
+            with self.subTest(url=url), self.assertRaises(ConfigError):
+                parse_config(
+                    {"ibilik": {"searches": [{"name": "a", "url": url}]}},
+                    base_dir=Path("."),
+                )
+
+    def test_url_cannot_be_combined_with_location_keys(self):
+        with self.assertRaises(ConfigError):
+            parse_config(
+                {
+                    "ibilik": {
+                        "searches": [
+                            {
+                                "name": "a",
+                                "url": "https://www.ibilik.com/room-rentals/search?city=cheras",
+                                "city": "cheras",
+                            }
+                        ]
+                    }
+                },
+                base_dir=Path("."),
+            )
+
+    def test_url_without_a_supported_filter_is_rejected(self):
+        with self.assertRaises(ConfigError):
+            parse_config(
+                {
+                    "ibilik": {
+                        "searches": [
+                            {
+                                "name": "a",
+                                "url": "https://www.ibilik.com/room-rentals/search?page=2",
+                            }
+                        ]
+                    }
+                },
+                base_dir=Path("."),
+            )
+
+
 class MessageTests(unittest.TestCase):
     def test_message_carries_provider_title_price_location_and_time(self):
         item = ibilik_item("u1", title="<b>Cheap</b> & near rail", price=850)
@@ -264,7 +351,7 @@ class MessageTests(unittest.TestCase):
         self.assertIn("iBilik", message)
         self.assertIn("RM 850/month", message)
         self.assertIn("Selangor / Cheras / Bandar Mahkota Cheras", message)
-        self.assertIn("Posted 2 h ago", message)
+        self.assertIn("Posted 11 Oct 2025, 12:00 PM (2 h ago)", message)
         self.assertIn('href="https://www.ibilik.com/room-rentals/u1/slug"', message)
         self.assertIn("Open on iBilik", message)
 

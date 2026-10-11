@@ -159,12 +159,18 @@ without the Mudah permission flag.
 | `searches` | required | Non-empty list of search objects. |
 
 Each search object needs a unique `name` (`[A-Za-z0-9_-]{1,64}`) that namespaces
-its dedupe rows, plus filters:
+its dedupe rows, plus filters. A search is normally an explicit set of keys, but
+it may instead be a single `url` key pointing at an `ibilik.com` search URL: the
+site's `?property=`, `?city=`, `?area=`, `?state=` and `?search=` params are
+decoded into the filters below. A `url` cannot be combined with any of the
+location or `query` keys.
 
 | Filter | Notes |
 | --- | --- |
 | `query` | Free text, e.g. `sunway university`. |
 | `state`, `city`, `area` | iBilik location **codes**, lowercase hyphens like `selangor`, `cheras`, `bandar-mahkota-cheras`. Resolve them with `ibilik.py locations`. |
+| `property` | iBilik property **code**, e.g. `the-troika`. Resolve it with `ibilik.py locations`. |
+| `url` | A single `ibilik.com` search URL whose query params supply the filters; mutually exclusive with the location keys above. |
 | `min_price`, `max_price` | Monthly MYR. Checked again locally for `max_price`. |
 | `room_type` | `MASTER`, `GUEST`, `MIDDLE`, `STUDIO`, `SINGLE`, `SUITE`. |
 | `bathroom_type` | `PRIVATE`, `SHARED`. |
@@ -316,15 +322,16 @@ and the service makes no exactly-once claim. SQLite commit ordering and
 Each Mudah alert is HTML, with the title and quotes escaped and only an `https`
 URL on a `mudah.my` host linked. Oversized or malformed URLs are skipped, and
 the message is never sliced through the middle of the link markup. The body
-carries the title, the monthly rent, a relative posted time, and an "Open on
-Mudah" link. A listing with a missing, negative, or non-finite price is skipped
+carries the title, a `Mudah · ` provider label before the monthly rent, the
+absolute posting time in Malaysia time (MYT) with a relative age in parentheses,
+and an "Open on Mudah" link. A listing with a missing, negative, or non-finite price is skipped
 rather than sent without an asking price, and the rent is shown exactly (for
 example `RM 1,234.50`) rather than rounded.
 
 An iBilik alert follows the same rules with an `ibilik.com` URL. The body names
-the provider, then the title, the rent with its unit (`/month` or `/night`), the
-state/city/area, a relative posted time when the API gave one, and an "Open on
-iBilik" link. Contact numbers and WhatsApp flags are never included: they are
+the provider before the rent with its unit (`/month` or `/night`) on the same
+line, then the state/city/area when known, the absolute posting time in MYT with
+a relative age in parentheses, and an "Open on iBilik" link. Contact numbers and WhatsApp flags are never included: they are
 personal data and have no place in an alert.
 
 ## CLI

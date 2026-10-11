@@ -67,7 +67,7 @@ is kept.
 
 ### `search` filters
 
-`--search TEXT`, `--state CODE`, `--city CODE`, `--area CODE`,
+`--search TEXT`, `--state CODE`, `--city CODE`, `--area CODE`, `--property CODE`,
 `--min-price INT`, `--max-price INT`, `--room-type` (single value),
 `--bathroom-type` (single), `--unit-type` (single), `--floor-level` (single),
 `--min-sqft INT`, `--max-sqft INT`, `--kyc-verified`, `--amenity CODE`

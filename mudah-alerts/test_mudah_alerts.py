@@ -380,7 +380,7 @@ class MessageTests(unittest.TestCase):
         self.assertIn("&lt;b&gt;Cheap&lt;/b&gt; &amp; cheerful", message)
         self.assertIn('href="https://www.mudah.my/listing-1.htm"', message)
         self.assertIn("RM 850/month", message)
-        self.assertIn("Posted 2 h ago", message)
+        self.assertIn("Posted 11 Oct 2025, 12:00 PM (2 h ago)", message)
 
     def test_invalid_or_foreign_urls_return_none(self):
         for url in (

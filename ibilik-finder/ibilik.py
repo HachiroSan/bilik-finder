@@ -544,6 +544,7 @@ def add_filter_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--state", metavar="CODE", help="state code")
     parser.add_argument("--city", metavar="CODE", help="city code")
     parser.add_argument("--area", metavar="CODE", help="area code")
+    parser.add_argument("--property", metavar="CODE", help="property code")
     parser.add_argument("--min-price", type=int, metavar="INT", help="minimum monthly price (MYR)")
     parser.add_argument("--max-price", type=int, metavar="INT", help="maximum monthly price (MYR)")
     parser.add_argument("--room-type", choices=ROOM_TYPES, help="room type")
@@ -584,6 +585,8 @@ def build_search_params(args, page: int) -> dict:
         params["filter[city]"] = args.city
     if args.area:
         params["filter[area]"] = args.area
+    if args.property:
+        params["filter[property]"] = args.property
     if args.min_price is not None:
         params["filter[minPrice]"] = args.min_price
     if args.max_price is not None:
@@ -628,10 +631,10 @@ def filters_to_params(
     """Build the query mapping for the room-rental search endpoint.
 
     ``filters`` uses the same keys the CLI exposes: ``query``, ``state``,
-    ``city``, ``area``, ``min_price``, ``max_price``, ``room_type``,
-    ``bathroom_type``, ``unit_type``, ``floor_level``, ``min_sqft``,
-    ``max_sqft``, ``kyc_verified`` and ``amenities``. Missing or falsy values
-    simply omit that filter.
+    ``city``, ``area``, ``property``, ``min_price``, ``max_price``,
+    ``room_type``, ``bathroom_type``, ``unit_type``, ``floor_level``,
+    ``min_sqft``, ``max_sqft``, ``kyc_verified`` and ``amenities``. Missing or
+    falsy values simply omit that filter.
     """
     params: dict = {
         "limit": limit,
@@ -647,6 +650,8 @@ def filters_to_params(
         params["filter[city]"] = filters["city"]
     if filters.get("area"):
         params["filter[area]"] = filters["area"]
+    if filters.get("property"):
+        params["filter[property]"] = filters["property"]
     if filters.get("min_price") is not None:
         params["filter[minPrice]"] = filters["min_price"]
     if filters.get("max_price") is not None:
